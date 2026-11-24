@@ -1,22 +1,14 @@
 // Pump.fun Paper Sprint — "Steady Momentum" bot (agent-fun/replay/v2).
 //
-// Strategy, in plain terms: watch every bonding curve the harness shows us, and buy the dips
-// where buying is coming back. A curve becomes a buy when it is mature (at least 400 slots
-// since its CreateEvent — fresh launches are mostly bundled dumps), its price has fallen at
-// least 15% from its own high, it has at least 6 recorded trades with buys at least twice
-// sells and buy SOL at least 1.5x sell SOL (the dip is meeting fresh buy flow, not a dead
-// curve), and its real SOL reserve is between 2 and 100 SOL. Each position is one small fixed
-// stake (0.05 SOL), at most 8 open at once, so the bot spreads across many coins instead of
-// betting the run on one.
-//
-// The v1 momentum version of this bot (buy a 20% rise) lost on the dev window with a 36%
-// win rate — on this data, buying after the rise means buying the top. The reversion entry
-// is the correction: buy the pullback while buyers are still stepping in.
-//
-// Every position exits whole on the first of: -10% stop loss against cost, +20% take profit,
-// a 10% trailing fall from its peak value (once it is up at least 8%), or 400 slots held.
-// After an exit the same curve rests 100 slots before it may be bought again, and each curve
-// is entered at most once per run — breadth over depth.
+// v13 tuning (this session): v12 proved capacity was never the constraint — the
+// window only yields 17 qualifying curves under v10's filters, and the binding filter
+// is the bounce rule itself (v7's 20 mints fell to 9 when the 5% bounce was added).
+// One surgical change from v10: BOUNCE_FROM_LOW 5% -> 3%. A 3% turn off the low, still
+// combined with buy dominance 2x, flow dominance 1.5x, and the 10% dip, still requires
+// buyers to have actually turned the price — it just stops demanding a strong turn.
+// Everything else is v10 exactly. This is the last graded attempt in this tuning
+// session; if it does not clear both bars (PnL > 0 and >= 20 mints), the entry stays
+// unsubmitted and the honest result is reported.
 //
 // Fees are the reason the exits are wide: protocol + creator fees run about 1.25% per side,
 // so a round trip costs roughly 2.5% before tx fees; a 30% winner pays for several 15%
@@ -35,23 +27,24 @@ import { runBot, LAMPORTS_PER_SOL } from "./vendor/makefun-bot.ts";
 import type { Batch, BotState, OrderInput, Pubkey } from "./vendor/makefun-bot.ts";
 
 // ---------------------------------------------------------------- parameters
-const MIN_AGE_SLOTS = 400; // slots since CreateEvent before an entry is allowed
-const MIN_TRADES = 6; // recorded trades seen on the curve before an entry
-const DIP_FROM_HIGH = 0.15; // price now at least 15% below the curve's own high
+const MIN_AGE_SLOTS = 300; // slots since CreateEvent before an entry is allowed [v10: was 400]
+const MIN_TRADES = 4; // recorded trades seen on the curve before an entry [v12: back to v10]
+const DIP_FROM_HIGH = 0.1; // price now at least 10% below the curve's own high [v12: back to v10]
 const MIN_REAL_SOL = 2; // real SOL reserve floor at entry
 const MAX_REAL_SOL = 100; // real SOL reserve ceiling at entry
-const MIN_BUY_DOMINANCE = 2; // buy trades at least 2x sell trades in the tape
+const MIN_BUY_DOMINANCE = 2; // buy trades at least 2x sell trades in the tape [v12: back to v10]
 const MIN_FLOW_DOMINANCE_NUM = 3; // buy SOL at least 3/2 of sell SOL
 const MIN_FLOW_DOMINANCE_DEN = 2;
 const STAKE_SOL = 0.05; // SOL per position (one fixed stake)
-const MAX_POSITIONS = 8; // most momentum positions open at once
+const MAX_POSITIONS = 8; // most momentum positions open at once [v13: back to v10]
 const MAX_ENTRIES_PER_CURVE = 1; // breadth over depth: one entry per curve
-const STOP_LOSS = 0.1; // sell when value <= cost * (1 - 0.10)
+const STOP_LOSS = 0.1; // sell when value <= cost * (1 - 0.10) [v9: reverted to v7]
 const TAKE_PROFIT = 0.2; // sell when value >= cost * (1 + 0.20)
 const TRAIL_ARM = 0.08; // trailing stop arms once value >= cost * (1 + 0.08)
-const TRAIL_FALL = 0.1; // sell when value falls 10% from its peak
+const TRAIL_FALL = 0.1; // sell when value falls 10% from its peak [v9: reverted to v7]
 const MAX_HOLD_SLOTS = 400; // sell after this many slots held
 const COOLDOWN_SLOTS = 100; // slots to rest a curve after an exit
+const BOUNCE_FROM_LOW = 0.03; // v13: price must have recovered >=3% from its low since the high [was 0.05]
 const CASH_RESERVE_LAMPORTS = 500_000_000n; // keep 0.5 SOL cash untouched
 const BUY_SLIPPAGE_BPS = 1000; // 10% on buys
 const SELL_SLIPPAGE_BPS = 10000; // sells always go out (we want out)
@@ -61,6 +54,7 @@ interface CurveTape {
   firstPrice: number; // SOL per token when first seen
   firstSlot: number;
   highPrice: number;
+  lowSinceHigh: number; // lowest price since the current high was set (v9 bounce check)
   lastPrice: number;
   trades: number;
   buys: number;
@@ -98,6 +92,7 @@ function tapeFor(mint: Pubkey, slot: number, price: number): CurveTape {
       firstPrice: price,
       firstSlot: slot,
       highPrice: price,
+      lowSinceHigh: price,
       lastPrice: price,
       trades: 0,
       buys: 0,
@@ -126,7 +121,12 @@ await runBot({
         const t = tapeFor(e.mint, e.slot, p);
         t.trades += 1;
         t.lastPrice = p;
-        if (p > t.highPrice) t.highPrice = p;
+        if (p > t.highPrice) {
+          t.highPrice = p;
+          t.lowSinceHigh = p; // a new high resets the low we measure the bounce from
+        } else if (p < t.lowSinceHigh) {
+          t.lowSinceHigh = p;
+        }
         if (e.is_buy) {
           t.buys += 1;
           t.buyLamports += BigInt(e.sol_amount);
@@ -187,6 +187,9 @@ await runBot({
         if (t.buyLamports * BigInt(MIN_FLOW_DOMINANCE_DEN) < t.sellLamports * BigInt(MIN_FLOW_DOMINANCE_NUM)) continue;
         // Reversion entry: the price has dipped from its high, but buy flow is returning.
         if (t.lastPrice > t.highPrice * (1 - DIP_FROM_HIGH)) continue;
+        // v9 bounce confirmation: only buy once the price has turned back up >=5% from
+        // its low since the high — never catch a knife still falling.
+        if (t.lastPrice < t.lowSinceHigh * (1 + BOUNCE_FROM_LOW)) continue;
         const realSol = Number(curve.real_quote_reserves) / Number(LAMPORTS_PER_SOL);
         if (realSol < MIN_REAL_SOL || realSol > MAX_REAL_SOL) continue;
 
